@@ -40,20 +40,23 @@ jobs:
       - run: shellcheck -S warning linux/*.sh macos/*.command macos/*.sh
 
   e2e-windows:
+    # Builds the real Windows download (with bundled Python) and installs it like a user would.
     needs: unit
     runs-on: windows-latest
-    env: { DNSPRO_NO_TRAY: "1" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        id: py
         with: { python-version: "3.13" }
-      - name: Install
+      - name: Build the download
+        run: python build.py
+      - name: Install from the unzipped download
         shell: powershell
         run: |
-          $env:DNSPRO_PYTHON = "${{ steps.py.outputs.python-path }}"
-          powershell -NoProfile -ExecutionPolicy Bypass -File windows\install.ps1 -Quiet
+          Expand-Archive (Get-Item dist\DNSpro-*-windows.zip).FullName -DestinationPath $env:RUNNER_TEMP\pkg
+          $dir = (Get-ChildItem $env:RUNNER_TEMP\pkg -Directory)[0].FullName
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$dir\install.ps1" -Quiet
           if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\DNSpro\dnspro.log" -ErrorAction SilentlyContinue; exit 1 }
+          if (-not (Test-Path "$env:ProgramFiles\DNSpro\python\python.exe")) { 'bundled Python not installed'; exit 1 }
       - name: Ads blocked, normal sites work
         shell: powershell
         run: |
@@ -61,13 +64,25 @@ jobs:
           $ok = (Resolve-DnsName example.com -Type A -DnsOnly).IPAddress
           "doubleclick.net -> $ad"; "example.com -> $ok"
           if ($ad -ne '0.0.0.0' -or -not $ok -or $ok -eq '0.0.0.0') { exit 1 }
-          & "${{ steps.py.outputs.python-path }}" "$env:ProgramFiles\DNSpro\dnspro.py" status
+          & "$env:ProgramFiles\DNSpro\python\python.exe" "$env:ProgramFiles\DNSpro\dnspro.py" status
+      - name: Taskbar icon libraries load from the bundle
+        shell: powershell
+        run: |
+          $code = "import sys; sys.path.insert(0, r'$env:ProgramFiles\DNSpro'); import dnspro; " +
+                  "from PySide6.QtWidgets import QApplication, QSystemTrayIcon; app = QApplication(['t']); " +
+                  "icon = dnspro.shield_icon('#1f9d55', 'check'); assert not icon.isNull(); " +
+                  "print('Qt platform:', app.platformName(), '| tray available:', QSystemTrayIcon.isSystemTrayAvailable())"
+          & "$env:ProgramFiles\DNSpro\python\python.exe" -c $code
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep 3
+          Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" | Select-Object ProcessId, CommandLine | Format-List
       - name: Uninstall restores DNS
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\DNSpro\uninstall.ps1" -Quiet
           Start-Sleep 3
           if (Get-ScheduledTask -TaskName DNSpro -ErrorAction SilentlyContinue) { 'task still there'; exit 1 }
+          if (Test-Path "$env:ProgramFiles\DNSpro") { 'files left behind'; exit 1 }
           if (Get-DnsClientServerAddress | Where-Object { $_.ServerAddresses -contains '127.0.0.1' }) { 'DNS not restored'; exit 1 }
           $ad = (Resolve-DnsName doubleclick.net -Type A -DnsOnly).IPAddress
           "doubleclick.net -> $ad"; if ($ad -contains '0.0.0.0') { exit 1 }
