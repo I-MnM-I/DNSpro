@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -S warning linux/*.sh macos/*.command
+      - run: shellcheck -S warning linux/*.sh macos/*.command macos/*.sh
 
   e2e-windows:
     needs: unit
@@ -89,6 +89,22 @@ jobs:
           bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"
           if sudo launchctl print system/org.dnspro.server >/dev/null 2>&1; then echo "service still loaded"; exit 1; fi
           if /usr/bin/python3 dnspro.py selftest; then echo "ads still blocked after uninstall"; exit 1; fi
+
+  e2e-macos-oneliner:
+    # The Terminal one-liner from the README: downloads the latest published release.
+    needs: unit
+    runs-on: macos-latest
+    env: { DNSPRO_NO_TRAY: "1", DNSPRO_QUIET: "1" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install via one-liner
+        run: /bin/bash -c "$(cat macos/get-dnspro.sh)"
+      - name: Ads blocked, normal sites work
+        run: /usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py" selftest
+      - name: Uninstall
+        run: |
+          bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"
+          if /usr/bin/python3 dnspro.py selftest; then echo "still active after uninstall"; exit 1; fi
 
   e2e-linux:
     needs: unit
