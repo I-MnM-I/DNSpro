@@ -151,7 +151,9 @@ foreach ($k in $props.Keys) { New-ItemProperty -Path $reg -Name $k -Value $props
 # ---- point every network adapter's DNS at DNSpro, remembering the old settings
 Say 'Pointing Windows DNS at DNSpro'
 $saved = Join-Path $Data 'original-dns.json'
-$adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+# -IncludeHidden: some PCs (and VMs) route DNS through adapters Windows hides from the normal list
+$adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+  Where-Object { Get-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ErrorAction SilentlyContinue })
 if (-not (Test-Path $saved)) {
   $orig = foreach ($a in $adapters) {
     $g = $a.InterfaceGuid
@@ -188,6 +190,14 @@ Say 'Checking that it works'
 Start-Sleep -Seconds 2
 & $Py $Dns selftest --wait 30
 if ($LASTEXITCODE -ne 0) {
+  Write-Host "`n    Diagnostics (share these if you ask for help):"
+  Get-DnsClientServerAddress | Where-Object ServerAddresses |
+    Format-Table InterfaceAlias, InterfaceIndex, AddressFamily, ServerAddresses -AutoSize | Out-Host
+  Get-NetIPConfiguration | Format-Table InterfaceAlias, InterfaceIndex, IPv4DefaultGateway -AutoSize | Out-Host
+  Get-DnsClientNrptPolicy -ErrorAction SilentlyContinue | Format-Table Namespace, NameServers -AutoSize | Out-Host
+  $probe = "diag$(Get-Random)" + '.probe.dnspro.example'
+  try { "    direct to DNSpro: " + ((Resolve-DnsName $probe -Server 127.0.0.1 -DnsOnly -ErrorAction Stop).IPAddress -join ', ') } catch { "    direct to DNSpro: FAILED $($_.Exception.Message)" }
+  try { "    via Windows:      " + ((Resolve-DnsName $probe -DnsOnly -ErrorAction Stop).IPAddress -join ', ') } catch { "    via Windows:      FAILED $($_.Exception.Message)" }
   Restore-Dns
   Remove-Item $saved -Force
   Fail 'The check failed, so the DNS change was undone (your internet works as before).'
