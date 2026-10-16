@@ -198,6 +198,7 @@ if ($LASTEXITCODE -ne 0) {
   $probe = "diag$(Get-Random)" + '.probe.dnspro.example'
   try { "    direct to DNSpro: " + ((Resolve-DnsName $probe -Server 127.0.0.1 -DnsOnly -ErrorAction Stop).IPAddress -join ', ') } catch { "    direct to DNSpro: FAILED $($_.Exception.Message)" }
   try { "    via Windows:      " + ((Resolve-DnsName $probe -DnsOnly -ErrorAction Stop).IPAddress -join ', ') } catch { "    via Windows:      FAILED $($_.Exception.Message)" }
+  "    via getaddrinfo:  " + (& $Py -c "import socket,sys`ntry: print(sorted({a[4][0] for a in socket.getaddrinfo(sys.argv[1], 443)}))`nexcept Exception as e: print('FAILED', e)" $probe)
   Restore-Dns
   Remove-Item $saved -Force
   Fail 'The check failed, so the DNS change was undone (your internet works as before).'

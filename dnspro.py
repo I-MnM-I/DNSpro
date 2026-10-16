@@ -650,7 +650,39 @@ def set_blocking(cfg, turn_on=None):
     return "Ad blocking OFF", hint
 
 
+def lookup_windows(host):
+    """Ask the Windows DNS client directly (DnsQuery_W). getaddrinfo on Windows reports
+    'not found' for 0.0.0.0 answers, which would hide whether DNSpro answered."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DNS_RECORD(ctypes.Structure):
+        _fields_ = [("pNext", ctypes.c_void_p), ("pName", wintypes.LPWSTR), ("wType", wintypes.WORD),
+                    ("wDataLength", wintypes.WORD), ("Flags", wintypes.DWORD), ("dwTtl", wintypes.DWORD),
+                    ("dwReserved", wintypes.DWORD), ("Data", ctypes.c_byte * 16)]
+
+    dnsapi = ctypes.windll.dnsapi
+    addrs = set()
+    for qtype, family, size in ((1, socket.AF_INET, 4), (28, socket.AF_INET6, 16)):
+        result = ctypes.c_void_p()
+        if dnsapi.DnsQuery_W(host, qtype, 0, None, ctypes.byref(result), None) != 0 or not result.value:
+            continue
+        p = result.value
+        while p:
+            rec = DNS_RECORD.from_address(p)
+            if rec.wType == qtype:
+                addrs.add(socket.inet_ntop(family, bytes(rec.Data)[:size]))
+            p = rec.pNext
+        dnsapi.DnsRecordListFree(result, 1)
+    return addrs
+
+
 def lookup(host):
+    if IS_WINDOWS:
+        try:
+            return lookup_windows(host)
+        except (OSError, AttributeError, ValueError):
+            pass
     try:
         return {ai[4][0].split("%")[0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
     except socket.gaierror:
