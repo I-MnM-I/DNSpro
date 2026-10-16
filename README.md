@@ -25,11 +25,25 @@ malware sites, so a bad link is far less likely to hurt you.
 3. Wait for **"Done!"**. If Python isn't installed, the installer installs it for you.
 
 ### Mac (macOS 11 or newer)
+1. Open **Terminal** (press `Cmd+Space`, type *Terminal*, press Return).
+2. Paste this line and press Return:
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/I-MnM-I/DNSpro/main/macos/get-dnspro.sh)"
+   ```
+3. Enter your Mac password when asked (nothing appears while you type, that's normal), and wait for **"Done!"**.
+   - If macOS offers to install "command line developer tools", click **Install**, then paste the line again.
+
+This downloads the latest release, checks it against its published checksum, and runs the installer, without
+the "unidentified developer" block you get when downloading through a browser.
+
+<details><summary>Prefer to download the zip instead?</summary>
+
 1. Download **`DNSpro-…-macos.zip`** from the [Releases page](../../releases) and double-click it to unzip.
-2. **Right-click** **`Install DNSpro.command`** > **Open** > **Open**. (A plain double-click is blocked the first time
-   because the file isn't from the App Store.)
-3. Enter your Mac password when asked, and wait for **"Done!"**.
-   - If macOS offers to install "command line developer tools", click **Install**, then run the installer again.
+2. Double-click **`Install DNSpro.command`**. macOS will refuse because DNSpro isn't from an identified developer
+   (signing costs $99/year).
+3. Open **System Settings > Privacy & Security**, scroll down, and click **Open Anyway** next to the DNSpro message.
+   Confirm with your password, then click **Open**.
+</details>
 
 ### Linux
 Works on distributions that use systemd-resolved: Fedora, Ubuntu, Bazzite, Linux Mint, Pop!_OS and others.
@@ -53,7 +67,7 @@ Turn off your browser's own "secure DNS", or the browser goes around DNSpro:
 | **Turn on** | `Ctrl+Alt+Shift+A` or click the icon | Click the icon > *Turn on* | `Meta+Alt+A` or click the icon |
 | **Turn off** | `Ctrl+Alt+Shift+B` or click the icon | Click the icon > *Turn off* | `Meta+Alt+B` or click the icon |
 | **Dashboard** | http://127.0.0.1:5336 or Start menu > DNSpro | http://127.0.0.1:5336 | http://127.0.0.1:5336 |
-| **Uninstall** | Settings > Apps > DNSpro > Uninstall | Double-click *Uninstall DNSpro.command* | `./uninstall.sh` |
+| **Uninstall** | Settings > Apps > DNSpro > Uninstall | `bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"` in Terminal | `./uninstall.sh` |
 
 **Green shield** = blocking on. **Red** = off. **Yellow** = DNSpro isn't running.
 
