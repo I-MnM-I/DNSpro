@@ -1,0 +1,22 @@
+# Push a tag like v1.0.0 and this builds the downloads and publishes a GitHub Release.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: python -m unittest discover tests
+      - run: python build.py
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: dist/RELEASE_NOTES.md

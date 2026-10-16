@@ -1,0 +1,112 @@
+# Tests DNSpro on real Linux, Windows and macOS machines on every push,
+# including a full install -> check -> uninstall on each OS.
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: python -m unittest discover -v tests
+
+  scripts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell scripts parse cleanly
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem windows -Filter *.ps1) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $errs; exit 1 }
+          }
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning linux/*.sh macos/*.command
+
+  e2e-windows:
+    needs: unit
+    runs-on: windows-latest
+    env: { DNSPRO_NO_TRAY: "1" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: py
+        with: { python-version: "3.13" }
+      - name: Install
+        shell: powershell
+        run: |
+          $env:DNSPRO_PYTHON = "${{ steps.py.outputs.python-path }}"
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows\install.ps1 -Quiet
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\DNSpro\dnspro.log" -ErrorAction SilentlyContinue; exit 1 }
+      - name: Ads blocked, normal sites work
+        shell: powershell
+        run: |
+          $ad = (Resolve-DnsName doubleclick.net -Type A -DnsOnly).IPAddress
+          $ok = (Resolve-DnsName example.com -Type A -DnsOnly).IPAddress
+          "doubleclick.net -> $ad"; "example.com -> $ok"
+          if ($ad -ne '0.0.0.0' -or -not $ok -or $ok -eq '0.0.0.0') { exit 1 }
+          & "${{ steps.py.outputs.python-path }}" "$env:ProgramFiles\DNSpro\dnspro.py" status
+      - name: Uninstall restores DNS
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\DNSpro\uninstall.ps1" -Quiet
+          Start-Sleep 3
+          if (Get-ScheduledTask -TaskName DNSpro -ErrorAction SilentlyContinue) { 'task still there'; exit 1 }
+          if (Get-DnsClientServerAddress | Where-Object { $_.ServerAddresses -contains '127.0.0.1' }) { 'DNS not restored'; exit 1 }
+          $ad = (Resolve-DnsName doubleclick.net -Type A -DnsOnly).IPAddress
+          "doubleclick.net -> $ad"; if ($ad -contains '0.0.0.0') { exit 1 }
+
+  e2e-macos:
+    needs: unit
+    runs-on: macos-latest
+    env: { DNSPRO_NO_TRAY: "1", DNSPRO_QUIET: "1" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: bash macos/install.command || { sudo cat "/Library/Application Support/DNSpro/dnspro.log"; exit 1; }
+      - name: Ads blocked, normal sites work
+        run: |
+          /usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py" selftest
+          /usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py" status
+      - name: Uninstall restores DNS
+        run: |
+          bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"
+          if sudo launchctl print system/org.dnspro.server >/dev/null 2>&1; then echo "service still loaded"; exit 1; fi
+          if /usr/bin/python3 dnspro.py selftest; then echo "ads still blocked after uninstall"; exit 1; fi
+
+  e2e-linux:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start a systemd user session (CI machines don't have one by default)
+        run: |
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Install
+        run: bash linux/install.sh || { journalctl --user -u dnspro --no-pager | tail -50; exit 1; }
+      - name: Ads blocked, normal sites work
+        run: ~/.local/bin/dnspro selftest && ~/.local/bin/dnspro status
+      - name: Uninstall restores DNS
+        run: |
+          bash linux/uninstall.sh
+          [ ! -e /etc/systemd/resolved.conf.d/dnspro.conf ]
+          if python3 dnspro.py selftest; then echo "ads still blocked after uninstall"; exit 1; fi
