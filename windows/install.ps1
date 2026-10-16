@@ -164,8 +164,12 @@ if (-not (Test-Path $saved)) {
   ConvertTo-Json @($orig) | Set-Content -Path $saved -Encoding UTF8
 }
 foreach ($a in $adapters) {
-  try { Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @('127.0.0.1', '::1') }
-  catch { Write-Host "    (skipped adapter '$($a.Name)')" }
+  try {
+    # IPv4 first on its own: adapters with IPv6 turned off reject the whole list if it contains ::1
+    Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @('127.0.0.1') -ErrorAction Stop
+    try { Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @('127.0.0.1', '::1') -ErrorAction Stop } catch { }
+    Write-Host "    $($a.Name): done"
+  } catch { Write-Host "    $($a.Name): skipped ($($_.Exception.Message.Trim()))" }
 }
 Clear-DnsClientCache
 
