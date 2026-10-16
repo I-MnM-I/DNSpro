@@ -22,7 +22,7 @@ malware sites, so a bad link is far less likely to hurt you.
 2. Double-click **`Install DNSpro.bat`**. Click **Yes** when Windows asks for permission.
    - If you see *"Windows protected your PC"*, click **More info** > **Run anyway**. (This appears for any new
      program that isn't from a big company. You can read every line of DNSpro's code here.)
-3. Wait for **"Done!"**. If Python isn't installed, the installer installs it for you.
+3. Wait for **"Done!"**. Everything DNSpro needs is included in the download, so there's nothing else to install.
 
 ### Mac (macOS 11 or newer)
 1. Download **`DNSpro-…-macos.zip`** from the [Releases page](../../releases) and double-click it to unzip.
@@ -78,7 +78,8 @@ DNSpro runs a tiny DNS server on your own computer (`127.0.0.1`). When any app l
 [Quad9](https://quad9.net) (a non-profit resolver that also blocks malicious sites), with Cloudflare as a backup.
 
 Everything is one readable Python file, [`dnspro.py`](dnspro.py). The server uses only Python's standard library.
-The optional tray icon uses PySide6 (Qt).
+The optional tray icon uses PySide6 (Qt). The Windows download includes the official embeddable Python from
+python.org plus the parts of PySide6 the icon needs, pinned by SHA-256 in [`build.py`](build.py).
 
 | | Windows | Mac | Linux |
 |---|---|---|---|

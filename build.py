@@ -6,6 +6,7 @@ import io
 import re
 import shutil
 import tarfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,60 @@ ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 VERSION = re.search(r'^__version__ = "(.+)"', (ROOT / "dnspro.py").read_text(), re.M).group(1)
 STAMP = (2026, 1, 1, 0, 0, 0)  # fixed timestamps -> reproducible zips
+
+# The Windows download bundles Python and the bits of Qt the tray icon needs, so nobody has to
+# install Python. Pinned by version and SHA-256; bump both together.
+CACHE = ROOT / "build-cache"
+WINDOWS_DEPS = [
+    ("https://www.python.org/ftp/python/3.13.16/python-3.13.16-embed-amd64.zip",
+     "97dae5274cc54867065e8d5a3226e48c35017ed332a0fdb0e27d5b5821961297"),
+    ("https://files.pythonhosted.org/packages/03/61/9a7e32a37b224f68506785bfb0f288d516098ec71681782d72b695a6c95d/"
+     "pyside6_essentials-6.12.0-cp310-abi3-win_amd64.whl",
+     "c9a95102aa23c1f86516a30d5a9be37552d324eee7e567eb7508973f1218cb42"),
+    ("https://files.pythonhosted.org/packages/2a/b6/bee97e7a2edeab72aafabb46ee5adc939790a638d107860b4cad7a20e407/"
+     "shiboken6-6.12.0-cp310-abi3-win_amd64.whl",
+     "a1906cb8116869178c64b6bab52623bbc8b4ceed7b30bfc3c9aa0f6e67f6438e"),
+]
+# Only what the tray icon uses (QtCore/QtGui/QtWidgets + the Windows platform plugin): ~42 MB instead of ~220 MB.
+QT_KEEP = re.compile(r"""^(
+    PySide6/[^/]+\.(py|json|typed) | shiboken6/[^/]+\.(py|json|typed|dll)
+  | PySide6/(Qt6Core|Qt6Gui|Qt6Widgets|pyside6\.abi3|msvcp140[^/]*|concrt140|vcruntime140[^/]*)\.dll
+  | PySide6/Qt(Core|Gui|Widgets)\.pyd
+  | PySide6/plugins/platforms/qwindows\.dll | PySide6/plugins/styles/qmodernwindowsstyle\.dll
+)$""", re.X | re.I)
+
+
+def fetch(url, sha256):
+    CACHE.mkdir(exist_ok=True)
+    path = CACHE / url.rsplit("/", 1)[1]
+    if not path.exists():
+        print(f"  downloading {path.name}")
+        tmp = path.with_suffix(".part")
+        with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        tmp.replace(path)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+        path.unlink()
+        raise SystemExit(f"Checksum mismatch for {url}; refusing to build.")
+    return path
+
+
+def windows_runtime():
+    """Yields (path inside package, bytes) for the bundled Python + trimmed PySide6."""
+    (embed, _), *wheels = [(fetch(u, h), u) for u, h in WINDOWS_DEPS]
+    with zipfile.ZipFile(embed) as z:
+        for name in z.namelist():
+            data = z.read(name)
+            if name.endswith("._pth"):
+                # Let the bundled Python find the tray icon libraries and run `site`.
+                data = data.replace(b"#import site", b"import site").rstrip() + b"\r\nLib\\site-packages\r\n"
+            yield f"python/{name}", data
+    for wheel, _ in wheels:
+        with zipfile.ZipFile(wheel) as z:
+            for name in z.namelist():
+                if QT_KEEP.match(name):
+                    yield f"python/Lib/site-packages/{name}", z.read(name)
+
 
 # (path inside package, source file, executable?, convert to Windows line endings?)
 PACKAGES = {
@@ -70,6 +125,11 @@ def build():
                     info.external_attr = (0o100755 if exe else 0o100644) << 16
                     info.compress_type = zipfile.ZIP_DEFLATED
                     z.writestr(info, content(src, crlf))
+                if platform == "windows":
+                    for name, data in windows_runtime():
+                        info = zipfile.ZipInfo(f"{top}/{name}", STAMP)
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        z.writestr(info, data)
         outputs.append(out)
         print(f"  {out.relative_to(ROOT)}  ({out.stat().st_size // 1024} KB)")
 
@@ -81,7 +141,7 @@ Free system-wide ad, tracker and malware blocking. Pick the download for your co
 
 | Your computer | Download | Then |
 |---|---|---|
-| **Windows 10/11** | `DNSpro-{VERSION}-windows.zip` | Unzip, double-click **Install DNSpro.bat** |
+| **Windows 10/11** | `DNSpro-{VERSION}-windows.zip` | Unzip, double-click **Install DNSpro.bat** (Python is included) |
 | **Mac** (macOS 11+) | `DNSpro-{VERSION}-macos.zip` | Unzip, right-click **Install DNSpro.command** > Open |
 | **Linux** | `DNSpro-{VERSION}-linux.tar.gz` | Extract, run `./install.sh` in a terminal |
 

@@ -44,7 +44,14 @@ function Find-Python {
 }
 
 Say 'Checking for Python'
-$Py = Find-Python
+# The release download includes its own Python (python\ next to this script), so nothing needs installing.
+$Bundled = Join-Path $Here 'python\python.exe'
+$UseBundle = (Test-Path $Bundled) -and -not $env:DNSPRO_PYTHON
+if ($UseBundle) {
+  $Py = $Bundled
+} else {
+  $Py = Find-Python
+}
 if (-not $Py) {
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Fail "Python isn't installed. Get it from https://www.python.org/downloads/ - in the installer choose`n   'Customize installation' and tick 'Install Python for all users'. Then run this again."
@@ -55,7 +62,7 @@ if (-not $Py) {
   $Py = Find-Python
   if (-not $Py) { Fail "Python couldn't be installed automatically. Install it from https://www.python.org/downloads/ ('Install for all users'), then run this again." }
 }
-Write-Host "    Using $Py"
+if ($UseBundle) { Write-Host '    Using the Python included with DNSpro' } else { Write-Host "    Using $Py" }
 
 # ---- stop an older copy (reinstall / upgrade)
 if (Get-ScheduledTask -TaskName 'DNSpro' -ErrorAction SilentlyContinue) {
@@ -78,6 +85,13 @@ Say "Installing DNSpro to $App"
 New-Item -ItemType Directory -Force -Path $App, $Data | Out-Null
 Copy-Item $Src (Join-Path $App 'dnspro.py') -Force
 Copy-Item (Join-Path $Here 'uninstall.ps1') (Join-Path $App 'uninstall.ps1') -Force
+Remove-Item (Join-Path $App 'venv') -Recurse -Force -ErrorAction SilentlyContinue  # left over from 1.0.0
+if ($UseBundle) {
+  # Installed under Program Files so only administrators can modify it (it runs as SYSTEM).
+  robocopy (Join-Path $Here 'python') (Join-Path $App 'python') /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+  if ($LASTEXITCODE -ge 8) { Fail "Couldn't copy DNSpro's files to $App." }
+  $Py = Join-Path $App 'python\python.exe'
+}
 # Settings and blocklists: only SYSTEM and administrators may change them; users may read.
 icacls $Data /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
 $Dns = Join-Path $App 'dnspro.py'
@@ -118,15 +132,21 @@ New-Shortcut (Join-Path $StartMenu 'DNSpro\Uninstall DNSpro.lnk') 'powershell.ex
 if ($env:DNSPRO_NO_TRAY) {
   Write-Host "`n    Skipping the taskbar icon (DNSPRO_NO_TRAY is set)."
 } else {
-  Say 'Adding the taskbar icon (downloads about 80 MB, one time)'
+  Say 'Adding the taskbar icon'
   $trayOk = $false
-  try {
-    & $Py -m venv (Join-Path $App 'venv')
-    & (Join-Path $App 'venv\Scripts\python.exe') -m pip install --disable-pip-version-check -q PySide6-Essentials
-    $trayOk = ($LASTEXITCODE -eq 0)
-  } catch { $trayOk = $false }
-  if ($trayOk) {
+  if ($UseBundle) {
+    $pyw = Join-Path $App 'python\pythonw.exe'
+    $trayOk = $true
+  } else {
+    Write-Host '    Downloading the icon libraries (about 80 MB, one time)...'
+    try {
+      & $Py -m venv (Join-Path $App 'venv')
+      & (Join-Path $App 'venv\Scripts\python.exe') -m pip install --disable-pip-version-check -q PySide6-Essentials
+      $trayOk = ($LASTEXITCODE -eq 0)
+    } catch { $trayOk = $false }
     $pyw = Join-Path $App 'venv\Scripts\pythonw.exe'
+  }
+  if ($trayOk) {
     $lnk = Join-Path $StartMenu 'StartUp\DNSpro.lnk'
     New-Shortcut $lnk $pyw "`"$Dns`" tray" 'DNSpro taskbar icon'
     New-Shortcut (Join-Path $StartMenu 'DNSpro\DNSpro.lnk') $pyw "`"$Dns`" tray" 'DNSpro taskbar icon'
