@@ -14,7 +14,7 @@ say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 pause() { [ -n "${DNSPRO_QUIET:-}" ] || read -r -p $'\nPress Return to close' _; }
 fail() { printf '\n\033[31m!! %s\033[0m\n' "$*"; pause; exit 1; }
 
-echo "DNSpro 1.0.0 - free system-wide ad, tracker and malware blocking"
+echo "DNSpro 1.2.0 - free system-wide ad, tracker and malware blocking"
 [ "$(uname)" = Darwin ] || fail "This installer is for macOS."
 [ "$(id -u)" -ne 0 ] || fail "Don't run this with sudo; it asks for your password when needed."
 
@@ -118,7 +118,7 @@ say "Checking that it works"
 sleep 2
 if "$PY" "$APP/dnspro.py" selftest --wait 30; then
   printf '\n\033[32mDone! Ads, trackers and malware are now blocked on this whole Mac.\033[0m\n'
-  echo "  Dashboard:   http://127.0.0.1:5336"
+  echo "  Dashboard:   menu bar shield > Open dashboard"
   echo "  Turn on/off: click the shield in the menu bar"
   echo "  Also turn OFF 'Secure DNS' in your browser, and iCloud Private Relay if you use it."
   echo "  To remove:   double-click 'Uninstall DNSpro.command' (a copy is in $APP)"

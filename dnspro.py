@@ -20,6 +20,7 @@ Commands:
   dnspro on | off          turn blocking on / off
   dnspro toggle            flip blocking on/off
   dnspro tray              show a taskbar / menu bar icon (needs PySide6)
+  dnspro dashboard         open the dashboard in your browser
   dnspro update            download the latest blocklists now
   dnspro check DOMAIN      say whether DOMAIN is blocked and by which rule
   dnspro allow DOMAIN      never block DOMAIN (or its subdomains)
@@ -30,20 +31,25 @@ Commands:
 The server needs only the Python 3.9+ standard library.
 """
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
+import ssl
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 from collections import Counter, OrderedDict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 IS_WINDOWS = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -63,13 +69,19 @@ else:
     DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "dnspro"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 BLOCKLIST_FILE = DATA_DIR / "blocklist.txt"
+LISTS_DIR = DATA_DIR / "lists"     # last good copy of each blocklist
+KEY_FILE = CONFIG_DIR / "api-key"  # needed to turn DNSpro off or see what it logged
 
 DEFAULT_CONFIG = {
     "listen": ["127.0.0.1", "::1"] if SYSTEM_SERVICE else ["127.0.0.1"],
     "dns_port": 53 if SYSTEM_SERVICE else 5335,
     "dashboard_port": 5336,
-    # Quad9 (blocks known-malicious domains too) with Cloudflare as backup.
-    "upstreams": ["9.9.9.9", "1.1.1.1"],
+    # Quad9 (blocks known-malicious domains too) with Cloudflare as backup, both over
+    # DNS-over-TLS so nobody on the network can read or change the answers.
+    "upstreams": ["tls://9.9.9.9#dns.quad9.net", "tls://1.1.1.1#cloudflare-dns.com"],
+    # If the encrypted servers can't be reached (a few networks block port 853), use
+    # ordinary DNS to the same servers rather than cutting off the internet.
+    "unencrypted_fallback": True,
     "lists": {
         # Well-maintained lists with few false positives. Add or remove as you like (https only).
         "HaGeZi Pro": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
@@ -83,23 +95,37 @@ DEFAULT_CONFIG = {
     "cache_size": 10000,
 }
 
+OLD_DEFAULT_UPSTREAMS = ["9.9.9.9", "1.1.1.1"]  # 1.0.x; upgraded to encrypted on load
+
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9-]{2,63}$")
 # DNSpro always answers <anything>.probe.dnspro.example with 0.0.0.0 (even when paused), so
 # selftest/tray can tell whether this computer's DNS really goes through DNSpro. A normal
 # resolver answers "doesn't exist" (.example is reserved). Random names dodge DNS caches.
 PROBE_SUFFIX = ".probe.dnspro.example"
+# Answering "doesn't exist" for these tells Firefox not to switch on its own encrypted DNS,
+# and Apple devices not to use iCloud Private Relay. Either would send lookups around DNSpro.
+BYPASS_CANARIES = {"use-application-dns.net", "mask.icloud.com", "mask-h2.icloud.com"}
+# A downloaded blocklist that would block any of these (or the sites the lists come from)
+# is broken or has been tampered with, so DNSpro keeps the last good copy of it instead.
+MUST_WORK = ("google.com", "www.google.com", "youtube.com", "microsoft.com", "windowsupdate.com",
+             "apple.com", "icloud.com", "github.com", "raw.githubusercontent.com", "wikipedia.org",
+             "amazon.com", "cloudflare.com", "mozilla.org", "example.com")
+MAX_LIST_BYTES = 200_000_000
 NULL_HOSTS = {"0.0.0.0", "127.0.0.1", "::", "::1", "localhost", "localhost.localdomain",
               "local", "broadcasthost", "ip6-localhost", "ip6-loopback"}
 
 NOT_ROUTED_HINT = "Run the DNSpro installer again (a VPN can also cause this)."
 if IS_WINDOWS:
     START_HINT = "Restart your PC, or run the DNSpro installer again"
+    LOCKED_HINT = "Only the account that installed DNSpro, or an administrator, can change it"
     SHORTCUT_ON, SHORTCUT_OFF = "Ctrl+Alt+Shift+A", "Ctrl+Alt+Shift+B"
 elif IS_MAC:
     START_HINT = "Run: sudo launchctl kickstart -k system/org.dnspro.server"
+    LOCKED_HINT = "Only administrators of this Mac can change it"
     SHORTCUT_ON = SHORTCUT_OFF = None
 else:
     START_HINT = "Run: systemctl --user start dnspro"
+    LOCKED_HINT = f"Only the account that installed it can change it (its key is {KEY_FILE})"
     SHORTCUT_ON, SHORTCUT_OFF = "Meta+Alt+A", "Meta+Alt+B"
 
 
@@ -116,6 +142,12 @@ def load_config():
             pass  # e.g. a normal user reading a system-wide install
     if isinstance(cfg["listen"], str):
         cfg["listen"] = [cfg["listen"]]
+    if cfg["upstreams"] == OLD_DEFAULT_UPSTREAMS:
+        cfg["upstreams"] = list(DEFAULT_CONFIG["upstreams"])
+        try:
+            save_config(cfg)
+        except OSError:
+            pass
     return cfg
 
 
@@ -136,14 +168,56 @@ def add_rule(cfg, domain, kind):
 
 
 def parse_upstream(s):
-    """'9.9.9.9', '2620:fe::fe', '1.2.3.4:5300' or '[2620:fe::fe]:53' -> (host, port)."""
-    if s.startswith("["):
-        host, _, port = s[1:].partition("]:")
-        return host.rstrip("]"), int(port or 53)
-    if s.count(":") == 1:
-        host, port = s.split(":")
-        return host, int(port)
-    return s, 53
+    """-> (scheme, host, port, tls_name). Accepts 'tls://9.9.9.9#dns.quad9.net' (DNS-over-TLS,
+    port 853, certificate must match the name after #), plain '9.9.9.9', '2620:fe::fe',
+    '1.2.3.4:5300', '[2620:fe::fe]:53', and 'tcp://1.2.3.4:53'."""
+    scheme, sep, rest = s.partition("://")
+    if not sep:
+        scheme, rest = "udp", s
+    rest, _, name = rest.partition("#")
+    default = 853 if scheme == "tls" else 53
+    if rest.startswith("["):
+        host, _, port = rest[1:].partition("]:")
+        host, port = host.rstrip("]"), int(port or default)
+    elif rest.count(":") == 1:
+        host, port = rest.split(":")
+        port = int(port)
+    else:
+        host, port = rest, default
+    if scheme not in ("udp", "tcp", "tls") or (scheme == "tls") != bool(name):
+        raise ValueError(f"bad upstream {s!r} (DNS-over-TLS needs a name: tls://IP#name)")
+    return scheme, host, port, name or None
+
+
+# ---------------------------------------------------------------- API key
+
+def read_key():
+    try:
+        return KEY_FILE.read_text(encoding="ascii").strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_key():
+    """The server's secret API key. Only accounts allowed to turn DNSpro off can read it:
+    you (Linux), administrators (macOS), the installing account and administrators (Windows,
+    set by the installer)."""
+    key = read_key()
+    if key:
+        return key
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return read_key()
+    key = secrets.token_hex(32)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(key + "\n")
+    if IS_MAC and os.geteuid() == 0:
+        import grp
+        os.chown(KEY_FILE, 0, grp.getgrnam("admin").gr_gid)
+        os.chmod(KEY_FILE, 0o640)
+    return key
 
 
 # ---------------------------------------------------------------- blocklists
@@ -169,25 +243,59 @@ def parse_line(line):
     return line
 
 
+def list_problem(found, previous_count, must_work):
+    """Why a freshly downloaded list looks wrong, or None if it looks fine."""
+    if not found:
+        return "it is empty"
+    for site in sorted(must_work):
+        labels = site.split(".")
+        for i in range(len(labels) - 1):
+            if ".".join(labels[i:]) in found:
+                return f"it would block {site}"
+    if previous_count and not previous_count / 4 <= len(found) <= previous_count * 4 + 1000:
+        return f"its size changed suspiciously ({previous_count:,} -> {len(found):,} domains)"
+    return None
+
+
 def update_lists(cfg):
-    """Download, merge and save the blocklists. Returns True on success."""
-    domains = set()
+    """Download, check, merge and save the blocklists. Returns True if any list was downloaded.
+    A list that fails to download or looks wrong is replaced by its last good copy."""
+    LISTS_DIR.mkdir(parents=True, exist_ok=True)
+    must_work = set(MUST_WORK) | {urlparse(u).hostname for u in cfg["lists"].values()} - {None}
+    domains, fresh = set(), 0
     for name, url in cfg["lists"].items():
         if not url.lower().startswith("https://"):
             print(f"  ! {name}: skipped (only https:// lists are allowed)")
             continue
+        saved = LISTS_DIR / (hashlib.sha256(url.encode()).hexdigest()[:16] + ".txt")
+        previous_count = 0
+        if saved.exists():
+            with saved.open(encoding="utf-8") as f:
+                previous_count = sum(1 for _ in f)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": f"DNSpro/{__version__}"})
             with urllib.request.urlopen(req, timeout=60) as r:
-                text = r.read().decode("utf-8", "replace")
+                data = r.read(MAX_LIST_BYTES + 1)
+            if len(data) > MAX_LIST_BYTES:
+                raise ValueError("it is far too big")
+            found = {d for d in map(parse_line, data.decode("utf-8", "replace").splitlines()) if d}
+            problem = list_problem(found, previous_count, must_work)
         except Exception as e:
-            print(f"  ! {name}: failed ({e})")
+            found, problem = None, f"download failed ({e})"
+        if problem:
+            keep = "; using the last good copy" if previous_count else ""
+            print(f"  ! {name}: not used, {problem}{keep}")
+            if previous_count:
+                domains |= set(saved.read_text(encoding="utf-8").split())
             continue
-        found = {d for d in map(parse_line, text.splitlines()) if d}
+        tmp = saved.with_suffix(".tmp")
+        tmp.write_text("\n".join(sorted(found)) + "\n", encoding="utf-8")
+        tmp.replace(saved)
+        fresh += 1
         print(f"  {name}: {len(found):,} domains")
         domains |= found
-    if not domains:
-        print("No lists downloaded; keeping the old blocklist.")
+    if not fresh:
+        print("No lists downloaded; keeping the current blocklist.", flush=True)
         return False
     # Drop subdomains already covered by a parent (we block wildcard-style).
     pruned = {d for d in domains if not any(
@@ -213,10 +321,13 @@ class Filter:
         labels = name.split(".")
         return (".".join(labels[i:]) for i in range(len(labels)))
 
+    def allows(self, name):
+        return any(s in self.allowed for s in self.suffixes(name.lower().rstrip(".")))
+
     def match(self, name):
         """Return the rule that blocks name, or None. Blocks all subdomains too."""
         name = name.lower().rstrip(".")
-        if any(s in self.allowed for s in self.suffixes(name)):
+        if self.allows(name):
             return None
         for s in self.suffixes(name):
             if s in self.blocked:
@@ -258,10 +369,33 @@ def blocked_response(query, qtype, q_end):
     return header + query[12:q_end] + answer
 
 
-def servfail(query, q_end):
+def empty_response(query, q_end, rcode):
     qid, flags = struct.unpack("!HH", query[:4])
-    flags = 0x8000 | (flags & 0x7900) | 0x0080 | 2
+    flags = 0x8000 | (flags & 0x7900) | 0x0080 | rcode
     return struct.pack("!HHHHHH", qid, flags, 1, 0, 0, 0) + query[12:q_end]
+
+
+def servfail(query, q_end):
+    return empty_response(query, q_end, 2)
+
+
+def nxdomain(query, q_end):
+    return empty_response(query, q_end, 3)
+
+
+def udp_limit(query, q_end):
+    """Biggest UDP answer the client accepts: 512 bytes, or what its EDNS record says."""
+    try:
+        if struct.unpack("!H", query[10:12])[0] and query[q_end] == 0 and query[q_end + 1:q_end + 3] == b"\x00\x29":
+            return max(512, struct.unpack("!H", query[q_end + 3:q_end + 5])[0])
+    except (IndexError, struct.error):
+        pass
+    return 512
+
+
+def truncate(resp, q_end):
+    """Header (with the 'truncated' flag) and question only: the client retries over TCP."""
+    return resp[:2] + bytes([resp[2] | 0x02, resp[3]]) + resp[4:6] + bytes(6) + resp[12:q_end]
 
 
 def skip_name(msg, i):
@@ -300,6 +434,91 @@ def matches_query(resp, query, q_end):
 
 # ---------------------------------------------------------------- server
 
+class UpstreamClosed(Exception):
+    """The server closed the connection before answering."""
+
+
+class StreamUpstream:
+    """A long-lived DNS-over-TLS (or plain TCP) connection to one server. Queries share it
+    and are matched to answers by ID (RFC 7766), so there's no handshake per lookup."""
+
+    def __init__(self, host, port, tls_name=None):
+        self.host, self.port, self.tls_name = host, port, tls_name
+        self.tls = None
+        if tls_name:
+            self.tls = ssl.create_default_context()  # checks the certificate and the name
+            self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.conn = None
+        self.lock = None
+        self.down_until = 0
+
+    class Conn:
+        def __init__(self, writer):
+            self.writer, self.pending, self.closed = writer, {}, False
+
+    async def connection(self):
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        async with self.lock:
+            if self.conn is None or self.conn.closed:
+                r, w = await asyncio.wait_for(asyncio.open_connection(
+                    self.host, self.port, ssl=self.tls, server_hostname=self.tls_name), 3)
+                self.conn = self.Conn(w)
+                asyncio.ensure_future(self.read_loop(r, self.conn))
+            return self.conn
+
+    @staticmethod
+    async def read_loop(reader, conn):
+        try:
+            while True:
+                n, = struct.unpack("!H", await reader.readexactly(2))
+                resp = await reader.readexactly(n)
+                fut = conn.pending.pop(resp[:2], None)
+                if fut and not fut.done():
+                    fut.set_result(resp)
+        except Exception:
+            pass
+        finally:
+            conn.closed = True
+            conn.writer.close()
+            for fut in conn.pending.values():
+                if not fut.done():
+                    fut.set_exception(UpstreamClosed())
+
+    def close(self):
+        if self.conn:
+            self.conn.writer.close()
+
+    async def query(self, query, q_end):
+        """The upstream's answer (with the client's ID), or None."""
+        if time.time() < self.down_until:
+            return None
+        for _ in range(2):  # the server may have just closed an idle connection: retry once
+            try:
+                conn = await self.connection()
+                qid = os.urandom(2)
+                while qid in conn.pending:
+                    qid = os.urandom(2)
+                msg = qid + query[2:]
+                fut = asyncio.get_running_loop().create_future()
+                conn.pending[qid] = fut
+                conn.writer.write(struct.pack("!H", len(msg)) + msg)
+                try:
+                    resp = await asyncio.wait_for(fut, 3)
+                finally:
+                    conn.pending.pop(qid, None)
+            except UpstreamClosed:
+                continue
+            except (OSError, asyncio.TimeoutError, ssl.SSLError):
+                # Can't connect, bad certificate, or no answer: skip this server for a bit.
+                self.down_until = time.time() + 30
+                if self.conn:
+                    self.conn.writer.close()
+                return None
+            return query[:2] + resp[2:] if matches_query(resp, msg, q_end) else None
+        return None
+
+
 class Blocker:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -311,15 +530,39 @@ class Blocker:
         self.top_blocked = Counter()
         self.top_allowed = Counter()
         self.recent = []
-        self.upstreams = [parse_upstream(u) for u in cfg["upstreams"]]
+        self.streams, self.plain = [], []  # DNS-over-TLS/TCP upstreams; plain UDP ones
+        fallback = []
+        for scheme, host, port, name in map(parse_upstream, cfg["upstreams"]):
+            if scheme == "udp":
+                self.plain.append((host, port))
+            else:
+                self.streams.append(StreamUpstream(host, port, name))
+                if scheme == "tls" and cfg.get("unencrypted_fallback", True):
+                    fallback.append((host, 53))
+        self.plain += fallback
+        self.via = None  # how the last lookup went out: "encrypted" / "unencrypted"
+        self.key = ensure_key()
+        self.sessions = OrderedDict()  # dashboard logins (browser cookies)
+        self.codes = {}                # one-time codes that log a browser in
 
     def log(self, name, status):
         self.recent.append((time.strftime("%H:%M:%S"), name, status))
         del self.recent[:-100]
 
+    async def forward(self, query, q_end, tcp):
+        for up in self.streams:
+            resp = await up.query(query, q_end)
+            if resp:
+                self.via = "encrypted" if up.tls else "unencrypted"
+                return resp
+        resp = await (self.forward_tcp if tcp else self.forward_udp)(query, q_end)
+        if resp:
+            self.via = "unencrypted"
+        return resp
+
     async def forward_udp(self, query, q_end):
         loop = asyncio.get_running_loop()
-        for host, port in self.upstreams:
+        for host, port in self.plain:
             # A fresh socket per query gives a random source port (anti-spoofing).
             sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
             sock.setblocking(False)
@@ -338,7 +581,7 @@ class Blocker:
         return None
 
     async def forward_tcp(self, query, q_end):
-        for host, port in self.upstreams:
+        for host, port in self.plain:
             w = None
             try:
                 r, w = await asyncio.wait_for(asyncio.open_connection(host, port), 3)
@@ -366,6 +609,9 @@ class Blocker:
             return None
         if name.endswith(PROBE_SUFFIX):
             return blocked_response(query, qtype, q_end)
+        if name in BYPASS_CANARIES and not self.filter.allows(name):
+            self.log(name, "blocked")  # listed so the dashboard can Allow it
+            return nxdomain(query, q_end)
         self.total += 1
         if self.active:
             rule = self.filter.match(name)
@@ -382,9 +628,9 @@ class Blocker:
             self.cached += 1
             self.cache.move_to_end(key)
             self.log(name, "cached")
-            return query[:2] + hit[1][2:]
+            return self.fit(query[:2] + hit[1][2:], query, q_end, tcp)
 
-        resp = await (self.forward_tcp(query, q_end) if tcp else self.forward_udp(query, q_end))
+        resp = await self.forward(query, q_end, tcp)
         if resp is None:
             self.log(name, "failed")
             return servfail(query, q_end)
@@ -396,7 +642,12 @@ class Blocker:
             if len(self.cache) > self.cfg["cache_size"]:
                 self.cache.popitem(last=False)
         self.log(name, "allowed")
-        return resp
+        return self.fit(resp, query, q_end, tcp)
+
+    @staticmethod
+    def fit(resp, query, q_end, tcp):
+        """Answers over TLS can be bigger than a UDP client accepts; tell it to use TCP."""
+        return resp if tcp or len(resp) <= udp_limit(query, q_end) else truncate(resp, q_end)
 
     def set_rule(self, domain, kind):
         add_rule(self.cfg, domain, kind)
@@ -439,26 +690,54 @@ class Blocker:
 
     # ---- dashboard / local API
 
-    def stats(self):
+    def stats(self, full=True):
+        """Counts are public; which sites were visited needs the key or a dashboard login."""
         # paused_seconds: 0 = on, >0 = paused for that long, -1 = off until turned on
         paused = -1 if self.paused_until == float("inf") else max(0, int(self.paused_until - time.time()))
-        return {
+        d = {
             "version": __version__,
             "total": self.total, "blocked": self.blocked, "cached": self.cached,
             "percent": round(100 * self.blocked / self.total, 1) if self.total else 0,
             "rules": len(self.filter.blocked), "uptime": int(time.time() - self.started),
-            "paused_seconds": paused,
-            "top_blocked": self.top_blocked.most_common(15),
-            "top_allowed": self.top_allowed.most_common(15),
-            "recent": self.recent[::-1][:50],
+            "paused_seconds": paused, "upstream": self.via,
         }
+        if full:
+            d.update(top_blocked=self.top_blocked.most_common(15),
+                     top_allowed=self.top_allowed.most_common(15),
+                     recent=self.recent[::-1][:50])
+        return d
+
+    def cookie_name(self):
+        return f"dnspro{self.cfg['dashboard_port']}"
+
+    def authorized(self, headers):
+        key = headers.get("x-dnspro-key", "")
+        if key and hmac.compare_digest(key.encode(), self.key.encode()):
+            return True
+        for part in headers.get("cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == self.cookie_name() and v in self.sessions:
+                return True
+        return False
+
+    def login(self, code):
+        """Swap a one-time code (from the tray or `dnspro dashboard`) for a browser session."""
+        now = time.time()
+        self.codes = {c: t for c, t in self.codes.items() if t > now}
+        if not code or self.codes.pop(code, 0) <= now:
+            return None
+        session = secrets.token_hex(32)
+        self.sessions[session] = now
+        while len(self.sessions) > 20:
+            self.sessions.popitem(last=False)
+        return session
 
     def allowed_hosts(self):
         p = self.cfg["dashboard_port"]
         return {f"127.0.0.1:{p}", f"localhost:{p}", f"[::1]:{p}"}
 
     def route(self, method, path, query, headers):
-        """Returns (status, content_type, body)."""
+        """Returns (status, content_type, body[, extra_headers])."""
         hosts = self.allowed_hosts()
         # DNS-rebinding protection: only answer requests addressed to localhost.
         if headers.get("host", "").lower() not in hosts:
@@ -473,10 +752,24 @@ class Blocker:
             return "405 Method Not Allowed", "application/json", b'{"ok":false}'
 
         ok = (b'{"ok":true}', b'{"ok":false}')
+        authorized = self.authorized(headers)
         if method == "GET" and path == "/":
-            return "200 OK", "text/html; charset=utf-8", DASHBOARD.encode()
+            return "200 OK", "text/html; charset=utf-8", (DASHBOARD if authorized else LOCKED_PAGE).encode()
+        if method == "GET" and path == "/login":
+            session = self.login(query.get("code", ""))
+            if not session:
+                return "403 Forbidden", "text/html; charset=utf-8", LOCKED_PAGE.encode()
+            return "303 See Other", "text/plain", b"", {
+                "Location": "/",
+                "Set-Cookie": f"{self.cookie_name()}={session}; Path=/; HttpOnly; SameSite=Strict"}
         if method == "GET" and path == "/api/stats":
-            return "200 OK", "application/json", json.dumps(self.stats()).encode()
+            return "200 OK", "application/json", json.dumps(self.stats(full=authorized)).encode()
+        if method == "POST" and not authorized:
+            return "403 Forbidden", "application/json", b'{"ok":false,"error":"locked"}'
+        if method == "POST" and path == "/api/login-code":
+            code = secrets.token_urlsafe(24)
+            self.codes[code] = time.time() + 60
+            return "200 OK", "application/json", json.dumps({"code": code}).encode()
         if method == "POST" and path == "/api/pause":
             try:
                 minutes = int(query.get("minutes", 5))
@@ -507,9 +800,10 @@ class Blocker:
                     headers[k.strip().lower()] = v.strip()
             url = urlparse(target)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
-            code, ctype, body = self.route(method, url.path, q, headers)
+            code, ctype, body, *extra = self.route(method, url.path, q, headers)
+            extra = "".join(f"{k}: {v}\r\n" for k, v in (extra[0] if extra else {}).items())
             writer.write(
-                f"HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+                f"HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{extra}"
                 "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
                 "X-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
                 "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
@@ -583,7 +877,8 @@ button:hover{border-color:var(--accent)}.blocked,.failed{color:var(--red)}.allow
 <div class="card"><div class="num" id="total">0</div><div class="lbl">Queries</div></div>
 <div class="card"><div class="num" id="blocked">0</div><div class="lbl">Blocked</div></div>
 <div class="card"><div class="num" id="percent">0%</div><div class="lbl">Blocked share</div></div>
-<div class="card"><div class="num" id="rules">0</div><div class="lbl">Rules</div></div></div>
+<div class="card"><div class="num" id="rules">0</div><div class="lbl">Rules</div></div>
+<div class="card"><div class="num" id="via">-</div><div class="lbl">Lookups to the internet</div></div></div>
 <div class="cols">
 <div class="card"><h2>Top blocked</h2><table id="tb"></table></div>
 <div class="card"><h2>Top allowed</h2><table id="ta"></table></div>
@@ -598,8 +893,11 @@ function action(tr,domain,isBlocked){const td=cell(tr,'','n'),b=document.createE
  b.textContent=isBlocked?'Allow':'Block';b.dataset.post=(isBlocked?'/api/allow':'/api/block')+'?domain='+encodeURIComponent(domain);td.appendChild(b)}
 function fill(table,rows,make){table.replaceChildren(...rows.map(r=>{const tr=document.createElement('tr');make(tr,r);return tr}))}
 async function load(){const s=await (await fetch('/api/stats')).json();
+ if(!s.recent){location.reload();return}  // logged out (DNSpro restarted): show how to log in
  for(const k of['total','blocked','rules'])$(k).textContent=s[k].toLocaleString();
  $('percent').textContent=s.percent+'%';
+ const v=$('via');v.textContent=s.upstream=='encrypted'?'Encrypted':s.upstream=='unencrypted'?'Not encrypted':'-';
+ v.className=s.upstream=='unencrypted'?'num blocked':'num';
  const st=$('state');st.className=s.paused_seconds?'blocked':'allowed';
  st.textContent=s.paused_seconds<0?'Off':s.paused_seconds?`Paused (${Math.ceil(s.paused_seconds/60)} min left)`:'Protection on';
  fill($('tb'),s.top_blocked,(tr,[d,n])=>{cell(tr,d);cell(tr,n,'n');action(tr,d,true)});
@@ -608,6 +906,17 @@ async function load(){const s=await (await fetch('/api/stats')).json();
 load();setInterval(load,2000);
 </script></body></html>"""
 
+LOCKED_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>DNSpro</title>
+<style>body{margin:0;background:#f6f7f9;color:#1b1f24;font:16px/1.5 system-ui,sans-serif}
+@media (prefers-color-scheme:dark){body{background:#111418;color:#e8eaed}}
+main{max-width:560px;margin:15vh auto;padding:0 16px}code{font-size:15px}</style></head><body><main>
+<h1>DNSpro dashboard</h1>
+<p>For your privacy, the dashboard only opens from this computer's DNSpro icon:
+click the shield icon and choose <b>Open dashboard</b>.</p>
+<p>Or run <code>dnspro dashboard</code> in a terminal.</p>
+</main></body></html>"""
+
 
 # ---------------------------------------------------------------- client side
 
@@ -615,10 +924,25 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never 
 
 
 def api(cfg, path, method="GET", timeout=3):
+    """Raises urllib.error.HTTPError 403 if this account can't read the key."""
+    headers = {"X-DNSpro": "1"}
+    key = read_key()
+    if key:
+        headers["X-DNSpro-Key"] = key
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['dashboard_port']}{path}",
-                                 method=method, headers={"X-DNSpro": "1"})
+                                 method=method, headers=headers)
     with _opener.open(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def open_dashboard(cfg):
+    import webbrowser
+    base = f"http://127.0.0.1:{cfg['dashboard_port']}"
+    try:
+        url = f"{base}/login?code={api(cfg, '/api/login-code', 'POST')['code']}"
+    except OSError:
+        url = base  # not running, or not allowed: the page explains
+    webbrowser.open(url)
 
 
 def notify(title, body):
@@ -642,6 +966,10 @@ def set_blocking(cfg, turn_on=None):
         if turn_on is None:
             turn_on = api(cfg, "/api/stats")["paused_seconds"] != 0
         api(cfg, "/api/resume" if turn_on else "/api/pause?minutes=0", "POST")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return "Not allowed", LOCKED_HINT
+        return "DNSpro isn't responding", START_HINT
     except OSError:
         return "DNSpro isn't running", START_HINT
     if turn_on:
@@ -696,7 +1024,6 @@ def is_null(addr):
 
 def dns_uses_dnspro():
     """True if this computer's DNS lookups actually go through DNSpro."""
-    import secrets
     addrs = lookup(secrets.token_hex(6) + PROBE_SUFFIX)
     return bool(addrs) and all(is_null(a) for a in addrs)
 
@@ -704,7 +1031,6 @@ def dns_uses_dnspro():
 def selftest(wait=0):
     """Check the computer's real DNS path. Retries for up to `wait` seconds (networks can
     take a few seconds to come back after the installer changes DNS settings)."""
-    import secrets
     deadline = time.time() + wait
     while True:
         routed = dns_uses_dnspro()
@@ -781,7 +1107,6 @@ def register_windows_hotkeys(app, callbacks):
 
 def tray(cfg):
     """Green shield = on, red = off, yellow = not running."""
-    import webbrowser
     from PySide6.QtCore import QDir, QLockFile, QTimer
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -808,8 +1133,7 @@ def tray(cfg):
     act_on = menu.addAction(icons["on"], on_label)
     act_off = menu.addAction(icons["off"], off_label)
     menu.addSeparator()
-    menu.addAction("Open dashboard").triggered.connect(
-        lambda: webbrowser.open(f"http://127.0.0.1:{cfg['dashboard_port']}"))
+    menu.addAction("Open dashboard").triggered.connect(lambda: open_dashboard(cfg))
     menu.addAction("Hide this icon").triggered.connect(app.quit)
     icon.setContextMenu(menu)
     state = {"value": "down", "routed": True}
@@ -925,6 +1249,10 @@ def main():
         run(cfg)
     elif cmd == "tray":
         tray(cfg)
+    elif cmd == "dashboard":
+        open_dashboard(cfg)
+    elif cmd == "init-key":  # used by the Windows installer before it locks the key file down
+        ensure_key()
     elif cmd in ("on", "off", "toggle"):
         title, body = set_blocking(cfg, {"on": True, "off": False, "toggle": None}[cmd])
         notify(title, body)
@@ -936,8 +1264,10 @@ def main():
             sys.exit(1)
         state = "ON" if d["paused_seconds"] == 0 else "OFF" if d["paused_seconds"] < 0 else \
             f"PAUSED ({-(-d['paused_seconds'] // 60)} min left)"
+        via = {"encrypted": "encrypted", "unencrypted": "NOT encrypted (this network may block "
+               "encrypted DNS)"}.get(d.get("upstream"), "none yet")
         print(f"Ad blocking: {state}\n{d['blocked']:,} of {d['total']:,} requests blocked ({d['percent']}%), "
-              f"{d['rules']:,} rules\nDashboard: http://127.0.0.1:{cfg['dashboard_port']}")
+              f"{d['rules']:,} rules\nLookups to the internet: {via}\nDashboard: dnspro dashboard")
         if not dns_uses_dnspro():
             print(f"WARNING: DNSpro is running, but this computer's DNS isn't going through it, so nothing "
                   f"is being blocked. {NOT_ROUTED_HINT}")
@@ -950,6 +1280,9 @@ def main():
             sys.exit(1)
         try:
             api(cfg, f"/api/{cmd}?domain={arg}", "POST")
+        except urllib.error.HTTPError as e:
+            print(f"Couldn't change it: {LOCKED_HINT if e.code == 403 else e}.")
+            sys.exit(1)
         except OSError:
             try:
                 add_rule(cfg, arg, "allowlist" if cmd == "allow" else "blocklist")

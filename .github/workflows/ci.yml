@@ -3,8 +3,16 @@
 name: CI
 on:
   push:
+    branches: [main]  # other branches are tested through their pull request (once, not twice)
   pull_request:
   workflow_dispatch:
+
+concurrency:  # a newer push replaces an older run that's still waiting
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   unit:
@@ -12,18 +20,23 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.9", "3.13"]
+        python: ["3.9", "3.13"]  # 3.9 = the python3 built into macOS
+        exclude:
+          - { os: ubuntu-latest, python: "3.9" }  # Ubuntu 26.04 has no Python 3.9 builds
+        include:
+          - { os: ubuntu-24.04, python: "3.9" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with: { python-version: "${{ matrix.python }}" }
       - run: python -m unittest discover -v tests
+        env: { DNSPRO_NETWORK_TESTS: "1" }  # includes real DNS-over-TLS to Quad9 and Cloudflare
 
   scripts:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: PowerShell scripts parse cleanly
         shell: pwsh
         run: |
@@ -36,7 +49,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - run: shellcheck -S warning linux/*.sh macos/*.command macos/*.sh
 
   e2e-windows:
@@ -44,8 +57,8 @@ jobs:
     needs: unit
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with: { python-version: "3.13" }
       - name: Build the download
         run: python build.py
@@ -65,6 +78,15 @@ jobs:
           "doubleclick.net -> $ad"; "example.com -> $ok"
           if ($ad -ne '0.0.0.0' -or -not $ok -or $ok -eq '0.0.0.0') { exit 1 }
           & "$env:ProgramFiles\DNSpro\python\python.exe" "$env:ProgramFiles\DNSpro\dnspro.py" status
+      - name: Security checks
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\DNSpro\python\python.exe" tests\e2e_security.py
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\DNSpro\dnspro.log" -Tail 30; exit 1 }
+          $acl = icacls "$env:ProgramData\DNSpro\api-key" | Out-String
+          $acl
+          if ($acl -match 'BUILTIN\\Users|Everyone|Authenticated Users') { 'key file readable by other accounts'; exit 1 }
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\DNSpro\DNSpro Dashboard.lnk")) { 'no dashboard shortcut'; exit 1 }
       - name: Taskbar icon libraries load from the bundle
         shell: powershell
         run: |
@@ -92,13 +114,19 @@ jobs:
     runs-on: macos-latest
     env: { DNSPRO_NO_TRAY: "1", DNSPRO_QUIET: "1" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install
         run: bash macos/install.command || { sudo cat "/Library/Application Support/DNSpro/dnspro.log"; exit 1; }
       - name: Ads blocked, normal sites work
         run: |
           /usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py" selftest
           /usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py" status
+      - name: Security checks
+        run: |
+          /usr/bin/python3 tests/e2e_security.py
+          ls -l "/Library/Application Support/DNSpro/api-key"
+          [ "$(stat -f %Lp "/Library/Application Support/DNSpro/api-key")" = 640 ]
+          [ "$(stat -f %Sg "/Library/Application Support/DNSpro/api-key")" = admin ]
       - name: Uninstall restores DNS
         run: |
           bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"
@@ -111,7 +139,7 @@ jobs:
     runs-on: macos-latest
     env: { DNSPRO_NO_TRAY: "1", DNSPRO_QUIET: "1" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install via one-liner
         run: /bin/bash -c "$(cat macos/get-dnspro.sh)"
       - name: Ads blocked, normal sites work
@@ -125,7 +153,7 @@ jobs:
     needs: unit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Start a systemd user session (CI machines don't have one by default)
         run: |
           sudo loginctl enable-linger "$USER"
@@ -136,6 +164,10 @@ jobs:
         run: bash linux/install.sh || { journalctl --user -u dnspro --no-pager | tail -50; exit 1; }
       - name: Ads blocked, normal sites work
         run: ~/.local/bin/dnspro selftest && ~/.local/bin/dnspro status
+      - name: Security checks
+        run: |
+          python3 tests/e2e_security.py
+          [ "$(stat -c %a ~/.config/dnspro/api-key)" = 600 ]
       - name: Uninstall restores DNS
         run: |
           bash linux/uninstall.sh
