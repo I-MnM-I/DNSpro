@@ -1,22 +1,36 @@
-# Push a tag like v1.0.0 and this builds the downloads and publishes a GitHub Release.
+# Push a tag like v1.2.0 and this builds the downloads and publishes a GitHub Release.
+# Each download gets a signed build-provenance attestation, so anyone can check it was built
+# by this workflow from this repository and not changed afterwards:
+#   gh attestation verify <file> -R I-MnM-I/DNSpro
 name: Release
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write      # create the release
+  id-token: write      # sign the attestations (Sigstore)
+  attestations: write  # store them on GitHub
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Actions are pinned to exact commits, so a hijacked tag can't change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with: { python-version: "3.13" }
       - run: python -m unittest discover tests
       - run: python build.py
-      - uses: softprops/action-gh-release@v2
+      - name: Version in the code matches the tag
+        run: test -f "dist/DNSpro-${GITHUB_REF_NAME#v}-windows.zip"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           files: dist/*
           body_path: dist/RELEASE_NOTES.md

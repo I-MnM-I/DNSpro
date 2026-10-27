@@ -135,17 +135,24 @@ def build():
 
     sums = "".join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in outputs)
     (DIST / "SHA256SUMS.txt").write_text(sums)
+    changes = ""
+    log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    if f"\n## {VERSION}\n" in log:
+        changes = "### What's new\n" + log.split(f"\n## {VERSION}\n", 1)[1].split("\n## ", 1)[0].strip() + "\n\n"
     (DIST / "RELEASE_NOTES.md").write_text(f"""## DNSpro {VERSION}
 
 Free system-wide ad, tracker and malware blocking. Pick the download for your computer:
 
-| Your computer | Download | Then |
-|---|---|---|
-| **Windows 10/11** | `DNSpro-{VERSION}-windows.zip` | Unzip, double-click **Install DNSpro.bat** (Python is included) |
-| **Mac** (macOS 11+) | `DNSpro-{VERSION}-macos.zip` | Unzip, right-click **Install DNSpro.command** > Open |
-| **Linux** | `DNSpro-{VERSION}-linux.tar.gz` | Extract, run `./install.sh` in a terminal |
+| Your computer | How to install |
+|---|---|
+| **Windows 10/11** | Download `DNSpro-{VERSION}-windows.zip`, unzip it, double-click **Install DNSpro.bat** (Python is included) |
+| **Mac** (macOS 11+) | Open Terminal and paste the one-line command from the README (no security warnings) |
+| **Linux** | Download `DNSpro-{VERSION}-linux.tar.gz`, extract it, run `./install.sh` in a terminal |
 
-See the README for details. `SHA256SUMS.txt` lets you verify the downloads.
+{changes}### Check a download is genuine
+Each file is signed by GitHub to prove it was built from this repository's code. With the
+[GitHub CLI](https://cli.github.com): `gh attestation verify <file> -R I-MnM-I/DNSpro`.
+`SHA256SUMS.txt` lists each file's checksum.
 """)
     print(f"Built DNSpro {VERSION} into dist/")
 

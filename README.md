@@ -52,10 +52,10 @@ tar xzf DNSpro-*-linux.tar.gz && cd DNSpro-*-linux && ./install.sh
 ```
 
 ### One more step: browsers
-Turn off your browser's own "secure DNS", or the browser goes around DNSpro:
+DNSpro already tells Firefox and iCloud Private Relay not to go around it. If you switched on
+"secure DNS" in your browser yourself, turn it off, or the browser skips DNSpro:
 - **Chrome / Edge / Brave:** Settings > Privacy and security > Security > *Use secure DNS* > **Off**
-- **Firefox:** Settings > Privacy & Security > *DNS over HTTPS* > **Off**
-- **Mac:** also turn off **iCloud Private Relay** if you use it
+- **Firefox:** Settings > Privacy & Security > *DNS over HTTPS* > **Default Protection** or **Off**
 
 ---
 
@@ -66,7 +66,7 @@ Turn off your browser's own "secure DNS", or the browser goes around DNSpro:
 | **Status** | Shield icon by the clock (click **^** if hidden) | Shield icon in the menu bar | Shield icon in the taskbar |
 | **Turn on** | `Ctrl+Alt+Shift+A` or click the icon | Click the icon > *Turn on* | `Meta+Alt+A` or click the icon |
 | **Turn off** | `Ctrl+Alt+Shift+B` or click the icon | Click the icon > *Turn off* | `Meta+Alt+B` or click the icon |
-| **Dashboard** | http://127.0.0.1:5336 or Start menu > DNSpro | http://127.0.0.1:5336 | http://127.0.0.1:5336 |
+| **Dashboard** | Click the icon > *Open dashboard*, or Start menu > DNSpro Dashboard | Click the icon > *Open dashboard* | Click the icon > *Open dashboard*, or `dnspro dashboard` |
 | **Uninstall** | Settings > Apps > DNSpro > Uninstall | `bash "/Library/Application Support/DNSpro/Uninstall DNSpro.command"` in Terminal | `./uninstall.sh` |
 
 **Green shield** = blocking on. **Red** = off. **Yellow** = DNSpro isn't running.
@@ -88,7 +88,7 @@ ads** and ads inside Facebook/Instagram. For those, also install the free browse
 
 DNSpro runs a tiny DNS server on your own computer (`127.0.0.1`). When any app looks up a name like
 `ads.example.com`, DNSpro checks it against the blocklists. Ad, tracker and malware domains get the answer
-`0.0.0.0` ("nowhere"), so they never load. Everything else is forwarded to
+`0.0.0.0` ("nowhere"), so they never load. Everything else is forwarded, encrypted (DNS-over-TLS), to
 [Quad9](https://quad9.net) (a non-profit resolver that also blocks malicious sites), with Cloudflare as a backup.
 
 Everything is one readable Python file, [`dnspro.py`](dnspro.py). The server uses only Python's standard library.
@@ -104,25 +104,41 @@ python.org plus the parts of PySide6 the icon needs, pinned by SHA-256 in [`buil
 
 ### Command line
 ```
-dnspro status | on | off | toggle | update | check DOMAIN | allow DOMAIN | block DOMAIN | selftest
+dnspro status | on | off | toggle | dashboard | update | check DOMAIN | allow DOMAIN | block DOMAIN | selftest
 ```
 (Windows: `"C:\Program Files\DNSpro\dnspro.py"` via `py`. Mac: `/usr/bin/python3 "/Library/Application Support/DNSpro/dnspro.py"`.)
 
 Settings live in `config.json`: upstream resolvers, blocklists (https only), update interval, and your own
-allow/block lists.
+allow/block lists. Upstreams are written `tls://IP#name` for DNS-over-TLS (the server's certificate must match
+`name`), or a plain IP for unencrypted DNS. Set `"unencrypted_fallback": false` to never use unencrypted DNS,
+even on networks that block encrypted DNS (lookups then fail there instead).
 
 ### Security
 DNSpro changes how your computer finds every website, so it's built defensively:
 - **Only reachable from this computer.** The DNS server and dashboard listen on `127.0.0.1`/`::1` only.
+- **Encrypted lookups.** Queries to Quad9/Cloudflare use DNS-over-TLS with full certificate checks, so your
+  network can't read or alter them. `dnspro status` and the dashboard say whether lookups are encrypted.
+- **Only you can switch it off.** Turning it on/off, changing rules and seeing which sites were visited need a
+  random key stored in a file only the installing account and administrators can read (`api-key` in the
+  settings folder). The dashboard logs in with a one-time code when you open it from the icon. Other accounts,
+  websites and sandboxed apps can't control DNSpro or read your history.
+- **No going around it.** DNSpro answers the "canary" names that tell Firefox not to switch on its own
+  encrypted DNS and Apple devices not to use iCloud Private Relay.
 - **Websites can't control it.** The dashboard API refuses requests from other sites (CSRF protection via a
   required custom header and an Origin check) and refuses requests not addressed to `localhost`
   (DNS-rebinding protection). That stops a malicious page from switching DNSpro off or reading your history.
 - **No code injection in the dashboard.** All data is inserted as plain text, and a strict Content-Security-Policy
   plus frame blocking are applied.
-- **Spoofed answers are rejected.** Each upstream query uses a fresh random port, and the reply must match the
-  query's ID and question.
+- **Spoofed answers are rejected.** Each upstream query uses a random ID (and, for unencrypted DNS, a fresh
+  random port), and the reply must match the query's ID and question.
+- **Checked blocklist updates.** A downloaded list that would block important sites (Google, Microsoft, Apple,
+  GitHub, the list sites themselves...) or that suddenly shrinks or grows more than 4x is rejected, and the last
+  good copy is used instead. Lists are https-only and capped at 200 MB.
 - **Files only admins can change.** On Windows and Mac the service runs with system rights, so its program,
   Python interpreter, settings and blocklists are stored where only administrators can modify them.
+- **Verifiable downloads.** Releases are built by GitHub Actions with every action pinned to an exact commit,
+  and each file carries a signed build-provenance attestation. Check one with the
+  [GitHub CLI](https://cli.github.com): `gh attestation verify DNSpro-1.2.0-windows.zip -R I-MnM-I/DNSpro`
 - **Safe install and uninstall.** The installer checks that DNS works before finishing, and undoes the change
   if it doesn't. The uninstaller restores your original DNS settings.
 
@@ -131,10 +147,11 @@ Found a security problem? Please open an issue (or a private security advisory) 
 ### Development
 ```bash
 python -m unittest discover -v tests   # unit + integration tests, no internet needed
+DNSPRO_NETWORK_TESTS=1 python -m unittest discover -v tests   # also real DNS-over-TLS
 python build.py                        # builds the three downloads into dist/
 ```
 GitHub Actions runs the tests on Windows, macOS and Linux (Python 3.9 and 3.13), and does a full
-install → check → uninstall on each OS. Pushing a tag like `v1.0.1` publishes a release automatically.
+install → check → uninstall on each OS. Pushing a tag like `v1.2.0` publishes a release automatically.
 
 ---
 

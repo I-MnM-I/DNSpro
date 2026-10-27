@@ -152,7 +152,7 @@ say "Checking that it works"
 sleep 2
 if "$BIN" selftest --wait 30; then
   printf '\n\033[32mDone! Ads, trackers and malware are now blocked on this whole computer.\033[0m\n'
-  echo "  Dashboard:  http://127.0.0.1:5336"
+  echo "  Dashboard:  shield icon > Open dashboard, or run: dnspro dashboard"
   echo "  Turn on/off: Meta+Alt+A / Meta+Alt+B, or click the shield icon"
   echo "  Also turn OFF 'Secure DNS' / 'DNS over HTTPS' in your browser settings, or the browser skips DNSpro."
 else

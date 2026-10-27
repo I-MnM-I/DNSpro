@@ -10,7 +10,7 @@ $Src = Join-Path $Here 'dnspro.py'
 if (-not (Test-Path $Src)) { $Src = Join-Path (Split-Path -Parent $Here) 'dnspro.py' }
 $App = Join-Path $env:ProgramFiles 'DNSpro'
 $Data = Join-Path $env:ProgramData 'DNSpro'
-$Version = '1.0.0'
+$Version = '1.2.0'
 
 function Say($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Done-Pause { if (-not $Quiet) { Read-Host "`nPress Enter to close" | Out-Null } }
@@ -100,6 +100,15 @@ Write-Host '    Downloading blocklists (first time only)...'
 & $Py $Dns update
 if ($LASTEXITCODE -ne 0) { Fail "Couldn't download the blocklists. Check your internet connection and try again." }
 
+# The key that turns DNSpro off and shows what it logged: only SYSTEM, administrators and
+# the account installing DNSpro may read it (not other accounts on this PC).
+& $Py $Dns init-key
+$KeyFile = Join-Path $Data 'api-key'
+$Owner = (Get-CimInstance Win32_ComputerSystem).UserName  # the signed-in user, even when elevated as another admin
+if (-not $Owner) { $Owner = "$env:USERDOMAIN\$env:USERNAME" }
+icacls $KeyFile /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' "${Owner}:R" | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail "Couldn't protect DNSpro's key file ($KeyFile)." }
+
 Say 'Starting the background service'
 $action = New-ScheduledTaskAction -Execute $Py -Argument "`"$Dns`" run" -WorkingDirectory $App
 $triggers = @(
@@ -125,7 +134,11 @@ function New-Shortcut($path, $target, $arguments, $desc) {
   $s.WorkingDirectory = $App; $s.Description = $desc; $s.Save()
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $StartMenu 'DNSpro') | Out-Null
-Set-Content -Path (Join-Path $StartMenu 'DNSpro\DNSpro Dashboard.url') -Value "[InternetShortcut]`r`nURL=http://127.0.0.1:5336/"
+Remove-Item (Join-Path $StartMenu 'DNSpro\DNSpro Dashboard.url') -Force -ErrorAction SilentlyContinue  # 1.0.x
+# Opens the dashboard already logged in (the page can't be opened by just typing its address).
+$PyNoConsole = Join-Path (Split-Path -Parent $Py) 'pythonw.exe'
+if (-not (Test-Path $PyNoConsole)) { $PyNoConsole = $Py }
+New-Shortcut (Join-Path $StartMenu 'DNSpro\DNSpro Dashboard.lnk') $PyNoConsole "`"$Dns`" dashboard" 'See what DNSpro has blocked'
 New-Shortcut (Join-Path $StartMenu 'DNSpro\Uninstall DNSpro.lnk') 'powershell.exe' `
   "-NoProfile -ExecutionPolicy Bypass -File `"$App\uninstall.ps1`"" 'Remove DNSpro and restore normal DNS'
 
@@ -164,7 +177,7 @@ $props = @{
   DisplayName = 'DNSpro'; DisplayVersion = $Version; Publisher = 'DNSpro contributors'
   InstallLocation = $App; NoModify = 1; NoRepair = 1
   UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$App\uninstall.ps1`""
-  URLInfoAbout = 'http://127.0.0.1:5336/'
+  URLInfoAbout = 'https://github.com/I-MnM-I/DNSpro'
 }
 foreach ($k in $props.Keys) { New-ItemProperty -Path $reg -Name $k -Value $props[$k] -Force | Out-Null }
 
@@ -224,8 +237,8 @@ if ($LASTEXITCODE -ne 0) {
   Fail 'The check failed, so the DNS change was undone (your internet works as before).'
 }
 Write-Host "`nDone! Ads, trackers and malware are now blocked on this whole PC." -ForegroundColor Green
-Write-Host '  Dashboard:   http://127.0.0.1:5336  (also in the Start menu)'
+Write-Host '  Dashboard:   Start menu > DNSpro Dashboard, or click the shield icon'
 Write-Host '  Turn on/off: Ctrl+Alt+Shift+A / Ctrl+Alt+Shift+B, or click the shield icon'
-Write-Host "  Also turn OFF 'Use secure DNS' in your browser settings, or the browser skips DNSpro."
+Write-Host "  If you turned ON 'Use secure DNS' in your browser, turn it off, or the browser skips DNSpro."
 Write-Host '  To remove: Settings > Apps > DNSpro > Uninstall'
 Done-Pause
